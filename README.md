@@ -1,5 +1,5 @@
 # Codex RLCD Pet Display
-
+修改成本地gemini账号限额 其他和原作者一致。
 一个运行在 Waveshare/微雪 `ESP32-S3-RLCD-4.2` 黑白全反射屏上的 Codex 额度桌面小屏。
 
 它通过电脑端 Python 脚本读取本机 Codex 账号的 rate limit，再用 BLE 同步到 ESP32-S3。主屏显示 Codex 额度、时间、房间温湿度、电池电量，并带一个会随 5h 额度使用情况变化心情的线条桌宠。
