@@ -18,15 +18,21 @@ SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 REFRESH_SECONDS = 10
+CODEX_REFRESH_SECONDS = 30
+CODEX_ERROR_BACKOFF_SECONDS = 120
 REQUEST_TIMEOUT_SECONDS = 15
 APP_NAME = "Codex BLE Sender"
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "codex_ble_sender.log"
+QUOTA_CACHE_PATH = ROOT / "codex_quota_cache.json"
 BLE_CHUNK_SIZE = 160
 HTTP = requests.Session()
 HTTP.trust_env = False
 LAST_GOOD_QUOTA = None
 PENDING_QUOTA = None
+LAST_QUOTA_RESULT = None
+LAST_CODEX_FETCH_AT = 0
+LAST_CODEX_ERROR_AT = 0
 
 STOCKS = [
     {"name": "上证指数", "code": "000001", "secid": "1.000001"},
@@ -270,6 +276,12 @@ def looks_like_bad_full_spike(current, previous):
     )
 
 
+def looks_like_initial_full_sample(current):
+    primary = current["primary"]
+    secondary = current["secondary"]
+    return primary["remaining"] >= 95 and secondary["remaining"] >= 95
+
+
 def stabilize_quota(primary, secondary, plan_type):
     global LAST_GOOD_QUOTA, PENDING_QUOTA
 
@@ -288,6 +300,10 @@ def stabilize_quota(primary, secondary, plan_type):
         "cached": False,
         "error": "",
     }
+
+    if not LAST_GOOD_QUOTA and looks_like_initial_full_sample(current):
+        PENDING_QUOTA = current
+        raise RuntimeError("initial Codex quota sample looked suspiciously full; waiting")
 
     if looks_like_bad_full_spike(current, LAST_GOOD_QUOTA):
         if PENDING_QUOTA and quota_key(primary, secondary) == quota_key(PENDING_QUOTA["primary"], PENDING_QUOTA["secondary"]):
@@ -311,6 +327,64 @@ def stabilize_quota(primary, secondary, plan_type):
     return current
 
 
+def compact_quota_state(state):
+    if not isinstance(state, dict):
+        return None
+    primary = state.get("primary")
+    secondary = state.get("secondary")
+    if not has_valid_quota(primary, secondary):
+        return None
+    return {
+        "primary": dict(primary),
+        "secondary": dict(secondary),
+        "plan_type": state.get("plan_type") or "unknown",
+    }
+
+
+def save_quota_cache(state):
+    compact = compact_quota_state(state)
+    if not compact:
+        return
+    compact["saved_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        QUOTA_CACHE_PATH.write_text(json.dumps(compact, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        log(f"Could not save quota cache: {exc}")
+
+
+def load_quota_cache():
+    try:
+        data = json.loads(QUOTA_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return compact_quota_state(data)
+
+
+def get_cached_quota():
+    return compact_quota_state(LAST_QUOTA_RESULT) or compact_quota_state(LAST_GOOD_QUOTA) or load_quota_cache()
+
+
+def seed_last_good_from_cache(state):
+    global LAST_GOOD_QUOTA
+    compact = compact_quota_state(state)
+    if LAST_GOOD_QUOTA is None and compact:
+        LAST_GOOD_QUOTA = {
+            "primary": compact["primary"],
+            "secondary": compact["secondary"],
+            "plan_type": compact["plan_type"],
+            "cached": False,
+            "error": "",
+        }
+
+
+def empty_quota():
+    return {
+        "primary": {"label": "5h", "used": -1, "remaining": -1, "reset": "-"},
+        "secondary": {"label": "7d", "used": -1, "remaining": -1, "reset": "-"},
+        "plan_type": "-",
+    }
+
+
 def is_codex_running():
     if os.name != "nt":
         return None
@@ -330,7 +404,10 @@ def is_codex_running():
 
 
 def build_payload():
+    global LAST_QUOTA_RESULT, LAST_CODEX_FETCH_AT, LAST_CODEX_ERROR_AT
+
     now = datetime.now()
+    monotonic_now = time.monotonic()
     running = is_codex_running()
     try:
         stocks = build_stocks()
@@ -338,26 +415,59 @@ def build_payload():
         log(f"Stock fetch failed: {exc}")
         stocks = []
 
-    try:
-        response = fetch_rate_limits()
-        snapshot = pick_snapshot(response)
-        primary = normalize_window(snapshot.get("primary"), "5h")
-        secondary = normalize_window(snapshot.get("secondary"), "7d")
-        plan_type = snapshot.get("planType") or "unknown"
-        stable = stabilize_quota(primary, secondary, plan_type)
-        primary = stable["primary"]
-        secondary = stable["secondary"]
-        plan_type = stable["plan_type"]
+    cached_quota = get_cached_quota()
+    seed_last_good_from_cache(cached_quota)
+    if running is False:
+        quota = cached_quota or empty_quota()
+        primary = quota["primary"]
+        secondary = quota["secondary"]
+        plan_type = quota["plan_type"]
+        ok = cached_quota is not None
+        status = "cached" if cached_quota else "waiting"
+        error = "Codex not running; quota fetch paused"
+    elif cached_quota and monotonic_now - LAST_CODEX_FETCH_AT < CODEX_REFRESH_SECONDS:
+        primary = cached_quota["primary"]
+        secondary = cached_quota["secondary"]
+        plan_type = cached_quota["plan_type"]
         ok = True
-        status = "cached" if stable["cached"] else ("running" if running else "not running")
-        error = stable["error"]
-    except Exception as exc:
-        primary = {"label": "5h", "used": -1, "remaining": -1, "reset": "-"}
-        secondary = {"label": "7d", "used": -1, "remaining": -1, "reset": "-"}
-        plan_type = "-"
-        ok = False
-        status = "error"
-        error = str(exc)[:80]
+        status = "running"
+        error = ""
+    elif cached_quota and LAST_CODEX_ERROR_AT and monotonic_now - LAST_CODEX_ERROR_AT < CODEX_ERROR_BACKOFF_SECONDS:
+        primary = cached_quota["primary"]
+        secondary = cached_quota["secondary"]
+        plan_type = cached_quota["plan_type"]
+        ok = True
+        status = "cached"
+        error = "Codex quota fetch is backing off"
+    else:
+        try:
+            response = fetch_rate_limits()
+            snapshot = pick_snapshot(response)
+            primary = normalize_window(snapshot.get("primary"), "5h")
+            secondary = normalize_window(snapshot.get("secondary"), "7d")
+            plan_type = snapshot.get("planType") or "unknown"
+            stable = stabilize_quota(primary, secondary, plan_type)
+            primary = stable["primary"]
+            secondary = stable["secondary"]
+            plan_type = stable["plan_type"]
+            ok = True
+            status = "cached" if stable["cached"] else "running"
+            error = stable["error"]
+            LAST_CODEX_FETCH_AT = monotonic_now
+            LAST_CODEX_ERROR_AT = 0
+            LAST_QUOTA_RESULT = compact_quota_state(stable)
+            if not stable["cached"]:
+                save_quota_cache(stable)
+        except Exception as exc:
+            LAST_CODEX_ERROR_AT = monotonic_now
+            log(f"Codex quota fetch failed: {exc}")
+            quota = cached_quota or empty_quota()
+            primary = quota["primary"]
+            secondary = quota["secondary"]
+            plan_type = quota["plan_type"]
+            ok = cached_quota is not None
+            status = "cached" if cached_quota else "error"
+            error = str(exc)[:80]
 
     return {
         "ok": ok,
