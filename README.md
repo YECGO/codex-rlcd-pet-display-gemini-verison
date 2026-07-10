@@ -1,15 +1,15 @@
-# Codex RLCD Pet Display
-修改成本地gemini账号限额 其他和原作者一致。
-一个运行在 Waveshare/微雪 `ESP32-S3-RLCD-4.2` 黑白全反射屏上的 Codex 额度桌面小屏。
+# Codex RLCD Pet Display - Gemini Version
 
-它通过电脑端 Python 脚本读取本机 Codex 账号的 rate limit，再用 BLE 同步到 ESP32-S3。主屏显示 Codex 额度、时间、房间温湿度、电池电量，并带一个会随 5h 额度使用情况变化心情的线条桌宠。
+修改成 **Google Gemini API** 账号限额显示。一个运行在 Waveshare/微雪 `ESP32-S3-RLCD-4.2` 黑白全反射屏上的 Gemini 额度桌面小屏。
 
-## Features
+它通过电脑端 Python 脚本调用 Gemini API 获取配额信息，再用 BLE 同步到 ESP32-S3。主屏显示 Gemini 配额、时间、房间温湿度、电池电量，并带一个会随 Gemini 日配额使用率自动变化的桌宠。
+
+## 特性
 
 - ESP32-S3 + 4.2 inch RLCD 横屏 UI，适配 `300x400` ST7305 黑白屏
 - BLE 串口式同步，不依赖 USB 数据线传输
-- Codex 5h / 7d quota remaining 显示
-- 桌宠 mood 跟随 5h `used%` 自动变化
+- Gemini 日/月配额使用率显示
+- 桌宠 mood 跟随日配额 `used%` 自动变化
   - `<20% used`: energetic
   - `<45% used`: normal
   - `<70% used`: tired
@@ -20,17 +20,17 @@
 - 可选股票页，支持 A 股行情和分时线同步
 - Windows 开机自启动桥接脚本
 
-## Hardware
+## 硬件
 
-Tested with:
+已测试：
 
-- Board: `ESP32-S3-RLCD-4.2`
-- MCU: `ESP32-S3-WROOM-1-N16R8`
-- Display: 4.2 inch reflective LCD, `300x400`, ST7305
-- Sensor: SHTC3 on I2C
-- Battery ADC: `GPIO4`, resistor divider ratio `3.0`
+- 开发板：`ESP32-S3-RLCD-4.2`
+- MCU：`ESP32-S3-WROOM-1-N16R8`
+- 屏幕：4.2 inch 反射式液晶屏，`300x400`，ST7305
+- 传感器：SHTC3（I2C）
+- 电池 ADC：`GPIO4`，分压比 `3.0`
 
-Important pins used by the firmware:
+固件使用的主要引脚：
 
 ```text
 RLCD_DC     GPIO5
@@ -44,7 +44,7 @@ I2C_SCL     GPIO14
 BAT_ADC     GPIO4
 ```
 
-## Project Layout
+## 项目布局
 
 ```text
 firmware/
@@ -52,10 +52,11 @@ firmware/
     ESP32S3_Codex_BLE_Monitor.ino
 
 bridge/
-  codex_ble_sender.py
-  codex_ble_autostart_watch.py
-  Start-Codex-BLE-Autostart-Watch.bat
-  Start-Codex-BLE-Sender-Visible.bat
+  gemini_ble_sender.py
+  gemini_ble_autostart_watch.py
+  Start-Gemini-BLE-Sender-Visible.bat
+  Start-Gemini-BLE-Autostart-Watch.bat
+  GEMINI_SETUP.md
 
 previews/
   preview_codex_fluffy_dog_v3.html
@@ -63,31 +64,31 @@ previews/
   preview_codex_line_dog.html
 ```
 
-## Setup
+## 设置
 
 ### 1. Arduino
 
-Install:
+安装：
 
 - Arduino IDE 2.x
 - ESP32 core `3.3.x`
 - `ArduinoJson`
 - `ST7305_MonoTFT_Library`
 
-Recommended board config:
+推荐开发板配置：
 
 ```text
 FQBN:
 esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
 ```
 
-Open and upload:
+打开并上传：
 
 ```text
 firmware/ESP32S3_Codex_BLE_Monitor/ESP32S3_Codex_BLE_Monitor.ino
 ```
 
-After flashing, the board advertises BLE as:
+刷写后，开发板以以下名称广播 BLE：
 
 ```text
 ESP32S3-Codex
@@ -95,35 +96,53 @@ ESP32S3-Codex
 
 ### 2. Python Bridge
 
-Install Python dependencies:
+安装 Python 依赖：
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-Run the visible sender for debugging:
+获取 Gemini API Key：
 
+1. 访问 [Google AI Studio](https://aistudio.google.com/app/apikeys)
+2. 创建新 API Key
+3. 复制 Key
+
+设置 API Key（选择一种方法）：
+
+**方法 A: 环境变量（推荐）**
 ```powershell
-bridge\Start-Codex-BLE-Sender-Visible.bat
+setx GEMINI_API_KEY "your_api_key_here"
 ```
 
-Run the background watcher:
-
-```powershell
-bridge\Start-Codex-BLE-Autostart-Watch.bat
+**方法 B: .env 文件**
+在 `bridge/` 目录创建 `.env` 文件：
+```
+GEMINI_API_KEY=your_api_key_here
 ```
 
-The watcher keeps the BLE sender alive. On Windows you can put the `.bat` in the Startup folder to start syncing after login.
+运行调试模式：
 
-## How It Works
+```powershell
+bridge\Start-Gemini-BLE-Sender-Visible.bat
+```
 
-1. `codex_ble_sender.py` starts `codex app-server --listen stdio://`.
-2. It calls `account/rateLimits/read`.
-3. It builds a compact JSON payload containing quota, time, and optional stock data.
-4. It sends the JSON over BLE in chunks to the ESP32-S3.
-5. The firmware redraws the RLCD home page and updates the mood pet.
+运行后台监视器：
 
-Example payload shape:
+```powershell
+bridge\Start-Gemini-BLE-Autostart-Watch.bat
+```
+
+监视器保持 BLE 发送器活跃。在 Windows 上，可以将 `.bat` 放在启动文件夹中，以在登录后开始同步。
+
+## 工作原理
+
+1. `gemini_ble_sender.py` 调用 Google Gemini API 获取配额信息
+2. 构建包含配额、时间和可选股票数据的紧凑 JSON 有效负载
+3. 通过 BLE 分块将 JSON 发送到 ESP32-S3
+4. 固件重绘 RLCD 主页并更新桌宠心情
+
+示例有效负载格式：
 
 ```json
 {
@@ -131,18 +150,18 @@ Example payload shape:
   "status": "running",
   "date": "07-08",
   "time": "11:03:44",
-  "primary": {"label": "5h", "used": 43, "remaining": 57, "reset": "07-08 14:30"},
-  "secondary": {"label": "7d", "used": 32, "remaining": 68, "reset": "07-14 00:00"}
+  "primary": {"label": "Daily", "used": 43, "remaining": 57, "reset": "24h"},
+  "secondary": {"label": "Month", "used": 32, "remaining": 68, "reset": "30d"}
 }
 ```
 
-## Notes
+## 注意
 
-- This is a hobby desktop display, not an official OpenAI product.
-- The BLE link is local between your PC and ESP32-S3.
-- The bridge reads Codex quota from the local Codex CLI/app-server. Your prompt text is not sent to the board.
-- Stock data uses public market endpoints and is best-effort.
+- 这是个人爱好项目，不是官方 Google 产品
+- BLE 链接是本地的，在您的 PC 和 ESP32-S3 之间
+- 桥接脚本从 Gemini API 读取配额，不会上传您的提示词
+- 股票数据使用公开行情端点，尽力而为
 
-## License
+## 许可证
 
 MIT
